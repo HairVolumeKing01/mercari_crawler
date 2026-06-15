@@ -1,0 +1,11 @@
+config.json
+__pycache__/
+*.pyc
+logs/
+*.db
+*.xlsx
+debug_product.html
+product_page.html
+mercari_images/
+.claude/
+*.lnk

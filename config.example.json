@@ -1,0 +1,17 @@
+{
+  "mercari_proxy": "http://127.0.0.1:7897",
+  "monitor": {
+    "keywords": [
+      "カラオケ WIND BREAKER",
+      "ちいかわ ハチワレ"
+    ],
+    "interval_minutes": 15
+  },
+  "smtp": {
+    "host": "smtp.qq.com",
+    "port": 465,
+    "user": "你的QQ号@qq.com",
+    "pass": "你的QQ邮箱授权码",
+    "to": "接收提醒的邮箱@qq.com"
+  }
+}
