@@ -24,8 +24,10 @@ import urllib.parse
 import traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
 from email.header import Header
 from email.policy import SMTP
+from email import encoders
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Optional, Callable
@@ -340,7 +342,7 @@ def _selenium_search_once(keyword: str, page: int = 1, order: str = "created_tim
 
     opts = Options()
     opts.binary_location = _CHROME_BIN
-    opts.add_argument("--headless")
+    opts.add_argument("--headless=new")
     opts.add_argument("--disable-vulkan")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -349,13 +351,13 @@ def _selenium_search_once(keyword: str, page: int = 1, order: str = "created_tim
     opts.add_argument("--disable-webgl")
     opts.add_argument("--disable-accelerated-2d-canvas")
     opts.add_argument("--disable-features=VizDisplayCompositor,UseSkiaRenderer")
-    opts.add_argument("--ignore-certificate-errors")
-    opts.add_argument("--ignore-ssl-errors")
-    opts.add_argument("--ignore-certificate-errors-spki-list")
-    opts.add_argument("--reduce-security-for-testing")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument(f"--proxy-server={PROXY}")
     opts.add_argument("--lang=ja")
     opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(f"--user-agent={UA}")
 
     try:
         driver = webdriver.Remote(f"http://127.0.0.1:{port}", options=opts)
@@ -370,9 +372,35 @@ def _selenium_search_once(keyword: str, page: int = 1, order: str = "created_tim
                 print(f"  [nav] connection error ({nav_err}), retry in 4s...")
                 time.sleep(4)
 
+        # Inject stealth JS to hide automation from Mercari bot detection
+        driver.execute_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP', 'ja', 'en-US', 'en']});
+            window.chrome = {runtime: {}};
+            const _origQ = window.navigator.permissions.query;
+            window.navigator.permissions.query = (p) => (
+                p.name === 'notifications' ?
+                Promise.resolve({state: Notification.permission}) :
+                _origQ(p)
+            );
+        """)
+
         # Diagnostic: check what page we got
         print(f"  [debug] Page title: {driver.title[:80]}")
         print(f"  [debug] URL: {driver.current_url[:100]}")
+
+        # Check if Mercari returned a bot-challenge page
+        ps = (driver.page_source or "")[:3000].lower()
+        if any(kw in ps for kw in [
+            "captcha", "recaptcha", "cf-challenge",
+            "access denied", "are you a robot",
+            "just a moment", "checking your browser",
+            "verify you are human", "security check",
+        ]):
+            print("  [blocked] Mercari returned a bot challenge page -- backing off")
+            driver.quit()
+            return result
 
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="item-grid-skeleton"], [data-testid="item-cell"]'))
@@ -604,11 +632,61 @@ def monitor(keyword: str | list[str], interval_min: int = 30,
                 print("[monitor] 3 consecutive failures, waiting 5min before retry...")
             time.sleep(60)  # wait 1min before retry on error
 
-        time.sleep(interval_min * 60)
+        time.sleep(max(3, interval_min) * 60)
 
 
 def to_dicts(items: list[Item]) -> list[dict]:
     return [asdict(it) for it in items]
+
+
+def _guess_image_subtype(data: bytes, url: str = "") -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    clean_url = (url or "").split("?", 1)[0].lower()
+    if clean_url.endswith((".jpg", ".jpeg")):
+        return "jpeg"
+    if clean_url.endswith(".png"):
+        return "png"
+    if clean_url.endswith(".gif"):
+        return "gif"
+    if clean_url.endswith(".webp"):
+        return "webp"
+    return "jpeg"
+
+
+def _download_inline_image(url: str, cid: str, max_bytes: int = 2_500_000):
+    if not url:
+        return None
+    data = _curl(url, raw=True, use_proxy=True, timeout=20)
+    if not data:
+        return None
+    if len(data) > max_bytes:
+        print(f"[email] inline image skipped: too large ({len(data)} bytes)")
+        return None
+    subtype = _guess_image_subtype(data, url)
+    if subtype == "webp":
+        try:
+            from io import BytesIO
+            from PIL import Image as PILImage
+            img = PILImage.open(BytesIO(data)).convert("RGB")
+            converted = BytesIO()
+            img.save(converted, format="JPEG", quality=88, optimize=True)
+            data = converted.getvalue()
+            subtype = "jpeg"
+        except Exception as e:
+            print(f"[email] inline image webp conversion failed: {e}")
+    return {
+        "cid": cid,
+        "payload": data,
+        "subtype": subtype,
+        "filename": f"{cid}.{subtype}",
+    }
 
 
 def _send_html_email(subject: str, body: str,
@@ -616,7 +694,8 @@ def _send_html_email(subject: str, body: str,
                      smtp_pass: str = "",
                      smtp_to: str = "",
                      smtp_host: str = "",
-                     smtp_port: int = 0) -> bool:
+                     smtp_port: int = 0,
+                     inline_parts: Optional[list[dict]] = None) -> bool:
     """Send an HTML email via SMTP. Handles UTF-8 body/subject safely."""
     smtp_user = smtp_user or SMTP_USER
     smtp_pass = smtp_pass or SMTP_PASS
@@ -634,11 +713,30 @@ def _send_html_email(subject: str, body: str,
 
     print(f"[email] notifier version: {EMAIL_NOTIFY_VERSION}")
 
-    msg = MIMEMultipart("alternative")
+    inline_parts = inline_parts or []
+    msg = MIMEMultipart("related" if inline_parts else "alternative")
     msg["From"] = smtp_user
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = Header(subject, "utf-8").encode()
-    msg.attach(MIMEText(body, "html", "utf-8"))
+    if inline_parts:
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body, "html", "utf-8"))
+        msg.attach(alt)
+        for part in inline_parts:
+            payload = part.get("payload") or b""
+            subtype = part.get("subtype") or "jpeg"
+            cid = part.get("cid") or ""
+            filename = part.get("filename") or "image"
+            if not payload or not cid:
+                continue
+            image_part = MIMEBase("image", subtype)
+            image_part.set_payload(payload)
+            encoders.encode_base64(image_part)
+            image_part.add_header("Content-ID", f"<{cid}>")
+            image_part.add_header("Content-Disposition", "inline", filename=filename)
+            msg.attach(image_part)
+    else:
+        msg.attach(MIMEText(body, "html", "utf-8"))
 
     try:
         payload = msg.as_bytes(policy=SMTP)
@@ -724,17 +822,29 @@ def send_email_notification(items: list[Item], keyword: str,
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     subject = f"Mercari新品提醒：{keyword}（{len(items)}件）"
     rows = []
-    for it in items:
+    inline_parts = []
+    for idx, it in enumerate(items):
         name = html.escape(it.name or "(no title)")
         url = html.escape(it.url or "")
         image_url = html.escape(it.image_url or "")
         seller = html.escape(it.seller or "")
         listed_at = html.escape(it.listed_at or "")
         price = f"¥{it.price:,}" if it.price else "价格未知"
+        image_src = image_url
+        if it.image_url:
+            import re as _re2
+            cid_suffix = _re2.sub(r"[^A-Za-z0-9]", "", it.id or str(idx)) or str(idx)
+            cid = f"mercari_{idx}_{cid_suffix}"
+            inline = _download_inline_image(it.image_url, cid)
+            if inline:
+                inline_parts.append(inline)
+                image_src = f"cid:{cid}"
+            else:
+                print(f"[email] inline image failed for {it.id}, using remote URL")
         image_html = (
-            f'<a href="{url}" target="_blank"><img src="{image_url}" '
+            f'<a href="{url}" target="_blank"><img src="{image_src}" '
             'style="width:160px;max-height:160px;object-fit:contain;border-radius:6px;border:1px solid #eee"></a>'
-            if image_url else ""
+            if image_src else ""
         )
         rows.append(f"""
         <tr>
@@ -766,7 +876,8 @@ def send_email_notification(items: list[Item], keyword: str,
 </body>
 </html>"""
     ok = _send_html_email(subject, body, smtp_user=smtp_user, smtp_pass=smtp_pass,
-                          smtp_to=smtp_to, smtp_host=smtp_host, smtp_port=smtp_port)
+                          smtp_to=smtp_to, smtp_host=smtp_host, smtp_port=smtp_port,
+                          inline_parts=inline_parts)
     if ok:
         print(f"[email] Sent {len(items)} new items")
     return ok
@@ -908,13 +1019,17 @@ def _fetch_items_headless(item_ids: list[str]) -> dict[str, dict]:
 
     opts = Options()
     opts.binary_location = _CHROME_BIN
-    opts.add_argument("--headless")
+    opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument(f"--proxy-server={PROXY}")
     opts.add_argument("--lang=ja")
     opts.add_argument("--window-size=1400,900")
+    opts.add_argument(f"--user-agent={UA}")
 
     driver = None
     try:
@@ -926,6 +1041,12 @@ def _fetch_items_headless(item_ids: list[str]) -> dict[str, dict]:
             print(f"\r  [detail] {idx+1}/{len(item_ids)} headless {item_id}...", end="")
             try:
                 driver.get(url)
+                driver.execute_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP', 'ja', 'en-US', 'en']});
+                    window.chrome = {runtime: {}};
+                """)
                 time.sleep(1.5)  # let JS hydrate
 
                 # Extract description
