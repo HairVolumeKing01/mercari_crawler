@@ -84,7 +84,7 @@ while ($true) {
 
         $job = Start-Job -Name "mercari_$($p.Name)" -ScriptBlock {
             param($pyArgs, $logPath, $tag)
-            & python $pyArgs 2>&1 |
+            & python -u $pyArgs 2>&1 |
                 ForEach-Object {
                     $line = "[$tag] " + $_.ToString()
                     Write-Host $line

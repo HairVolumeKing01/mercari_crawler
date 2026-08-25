@@ -321,14 +321,9 @@ def _selenium_search_once(keyword: str, page: int = 1, order: str = "created_tim
     import subprocess as sp
     import random
 
-    # Kill leftover Chrome/ChromeDriver from previous crashed cycles
-    try:
-        subprocess.run(["taskkill", "/f", "/im", "chrome.exe"], capture_output=True, timeout=5)
-        subprocess.run(["taskkill", "/f", "/im", "chromedriver.exe"], capture_output=True, timeout=5)
-    except Exception:
-        pass
-    time.sleep(1)
-
+    # No global taskkill here: it would kill concurrent profiles' browsers and
+    # the user's own Chrome. Each session uses a unique --user-data-dir below,
+    # so a leftover chrome from a crash is harmless (no profile-lock conflict).
     port = random.randint(10000, 60000)
     cd_proc = sp.Popen(
         [_CHROMEDRIVER, f"--port={port}", "--readable-timestamp"],
@@ -358,6 +353,7 @@ def _selenium_search_once(keyword: str, page: int = 1, order: str = "created_tim
     opts.add_argument("--lang=ja")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument(f"--user-agent={UA}")
+    opts.add_argument(f"--user-data-dir={os.path.join(os.environ.get('TEMP', '.'), f'mercari_chrome_{port}')}")
 
     try:
         driver = webdriver.Remote(f"http://127.0.0.1:{port}", options=opts)
@@ -629,8 +625,10 @@ def monitor(keyword: str | list[str], interval_min: int = 30,
             fail_count += 1
             print(f"[monitor] Error (#{fail_count}): {e}")
             if fail_count >= 3:
-                print("[monitor] 3 consecutive failures, waiting 5min before retry...")
-            time.sleep(60)  # wait 1min before retry on error
+                print("[monitor] 3 consecutive failures, backing off 5min...")
+                time.sleep(300)
+            else:
+                time.sleep(60)  # short retry on transient errors
 
         time.sleep(max(3, interval_min) * 60)
 
@@ -1002,14 +1000,7 @@ def _fetch_items_headless(item_ids: list[str]) -> dict[str, dict]:
     import subprocess as sp
     import random
 
-    # Kill leftovers
-    try:
-        sp.run(["taskkill", "/f", "/im", "chrome.exe"], capture_output=True, timeout=5)
-        sp.run(["taskkill", "/f", "/im", "chromedriver.exe"], capture_output=True, timeout=5)
-    except Exception:
-        pass
-    time.sleep(0.5)
-
+    # No global taskkill (see _selenium_search_once) — unique user-data-dir isolates sessions
     port = random.randint(10000, 60000)
     cd_proc = sp.Popen(
         [_CHROMEDRIVER, f"--port={port}", "--readable-timestamp"],
@@ -1030,6 +1021,7 @@ def _fetch_items_headless(item_ids: list[str]) -> dict[str, dict]:
     opts.add_argument("--lang=ja")
     opts.add_argument("--window-size=1400,900")
     opts.add_argument(f"--user-agent={UA}")
+    opts.add_argument(f"--user-data-dir={os.path.join(os.environ.get('TEMP', '.'), f'mercari_chrome_{port}')}")
 
     driver = None
     try:
@@ -1086,14 +1078,6 @@ def _fetch_items_headless(item_ids: list[str]) -> dict[str, dict]:
                 # Fallback: search page source for datetime in <time> tags
                 if not results[item_id]["listed_at"]:
                     html = driver.page_source
-                    # Debug: dump first item's HTML for diagnostics
-                    if idx == 0:
-                        with open("debug_product.html", "w", encoding="utf-8") as f:
-                            f.write(html)
-                        all_times = re.findall(r'<time[^>]*>', html)
-                        print(f"\n  [debug] <time> tags found: {len(all_times)}")
-                        dt_attrs = re.findall(r'datetime=([\"\\\'])([^\"\\\']+)\\1', html)
-                        print(f"  [debug] datetime attrs: {dt_attrs[:3]}")
                     for m_te in re.finditer(r'<time[^>]+datetime=["\']([^"\']+)["\']', html):
                         ts = _parse_ts(m_te.group(1))
                         if ts:
@@ -1370,7 +1354,7 @@ def _init_db(db_path: str = DB_DEFAULT):
 def save_to_sqlite(items: list[Item], db_path: str = DB_DEFAULT, keyword: str = "") -> int:
     """Insert items into SQLite. keyword tags the crawl source. Returns count of newly inserted items."""
     _init_db(db_path)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)  # wait up to 30s on concurrent writes
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     count = 0
     for it in items:
@@ -1413,7 +1397,7 @@ def get_keywords(db_path: str = DB_DEFAULT) -> list[str]:
 
 def _update_sqlite_item(item: Item, db_path: str = DB_DEFAULT):
     """Update an existing item's detail fields (seller, likes, description, comments, listed_at)."""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.execute("""
         UPDATE items SET seller=COALESCE(NULLIF(?, ''), seller),
                          likes=CASE WHEN ? > 0 THEN ? ELSE likes END,
