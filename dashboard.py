@@ -49,7 +49,6 @@ def init_db():
             image_url TEXT,
             url TEXT,
             seller TEXT,
-            likes INTEGER DEFAULT 0,
             description TEXT,
             comments TEXT,
             crawled_at TEXT,
@@ -137,7 +136,6 @@ _HTML = r"""<!DOCTYPE html>
   .card .name a:hover { color: var(--accent); }
   .card .meta { display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
   .card .price { font-weight: bold; color: #f0883e; font-size: 16px; }
-  .card .likes { color: var(--muted); font-size: 12px; }
   .card .seller { color: var(--muted); font-size: 12px; margin-top: 4px; }
   .card .desc { font-size: 12px; color: var(--muted); margin-top: 6px; max-height: 60px; overflow: hidden; line-height: 1.4; }
   .empty { text-align: center; color: var(--muted); padding: 60px 20px; }
@@ -225,7 +223,6 @@ function render() {
         <div class="name"><a href="${esc(it.url)}" target="_blank" title="${esc(it.name)}">${esc(it.name)}</a></div>
         <div class="meta">
           <span class="price">¥${Number(it.price).toLocaleString()}</span>
-          <span class="likes">❤ ${it.likes||0}</span>
         </div>
         ${it.seller ? `<div class="seller">👤 ${esc(it.seller)}</div>` : ''}
         ${it.description ? `<div class="desc">${esc(it.description)}</div>` : ''}

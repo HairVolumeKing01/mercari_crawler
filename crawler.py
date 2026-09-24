@@ -15,6 +15,7 @@ import json
 import os
 import re
 import html
+import shutil
 import smtplib
 import subprocess
 import sys
@@ -74,7 +75,6 @@ class Item:
     image_url: str
     url: str = ""
     seller: str = ""
-    likes: int = 0
     sold_out: bool = False
     description: str = ""
     comments: str = ""
@@ -158,6 +158,28 @@ def _parse_ts(ts) -> str:
         return ""
 
 
+_REL_JA_UNITS = {"秒": 1, "分": 60, "時間": 3600, "日": 86400,
+                 "週間": 604800, "ヶ月": 2592000, "か月": 2592000, "年": 31536000}
+
+
+def _parse_relative_ja(text: str) -> str:
+    """Convert Mercari's relative listing age ("14分前") → "YYYY-MM-DD HH:MM".
+
+    Item pages no longer expose an absolute timestamp: the <time datetime> node
+    was removed and only this relative string remains. 精度是分钟级，且随抓取
+    时刻漂移，所以只适合当作大致出品时间。
+    """
+    if not text:
+        return ""
+    if "たった今" in text:
+        return datetime.now().strftime("%Y-%m-%d %H:%M")
+    m = re.search(r'(\d+)\s*(秒|分|時間|日|週間|ヶ月|か月|年)前', text)
+    if not m:
+        return ""
+    secs = int(m.group(1)) * _REL_JA_UNITS[m.group(2)]
+    return datetime.fromtimestamp(time.time() - secs).strftime("%Y-%m-%d %H:%M")
+
+
 # ==================== HTML Parser ====================
 def _search_session_id(html: str) -> str:
     """Extract searchSessionId from SSR page."""
@@ -190,7 +212,6 @@ def _parse_items_from_json(html: str) -> list[Item]:
                     price=int(it.get("price", 0) or 0),
                     image_url=(it.get("thumbnails") or [""])[0],
                     seller=(it.get("seller") or {}).get("name", ""),
-                    likes=int(it.get("numLikes", 0) or 0),
                     sold_out=False,
                     listed_at=listed_at,
                 ))
@@ -227,49 +248,126 @@ _CHROME_BIN = os.environ.get("CHROME_BIN",
 _CHROMEDRIVER = os.environ.get("CHROMEDRIVER",
     "C:\\Users\\WUDIFALIANGWANG\\Downloads\\chromedriver\\chromedriver-win64\\chromedriver.exe")
 
+# ==================== DOM Selectors ====================
+# ALL Mercari DOM coupling lives here. When the crawler starts returning 0 items,
+# blank names/prices, or empty seller/description, check this block FIRST — a
+# silent testid rename is almost always the cause. Verified live 2026-09-24.
+#
+# Known breakages to date:
+#   2026-09  card lost [role="img"][aria-label] (title+price) and both the card
+#            and the item page lost data-testid="like-count"
+#   2026-09  item page lost <time datetime> (now relative text) and
+#            data-testid="seller-name" / "description" hydration moved later
+SELECTORS = {
+    # --- search results page ---
+    "search_item_cell":     '[data-testid="item-cell"]',
+    "search_grid_skeleton": '[data-testid="item-grid-skeleton"]',
+
+    # --- one card in the grid ---
+    "card_link":            '[data-testid="thumbnail-link"]',       # href -> /item/<id>
+    "card_name":            '[data-testid="thumbnail-item-name"]',  # full title
+    "card_price":           '[data-testid="item-tile-price"]',      # renders "¥666"
+
+    # --- item detail page ---
+    "detail_root":          '[data-testid="item-detail-container"]',
+    "detail_description":   '[data-testid="description"]',
+    "detail_seller":        '[data-testid="seller-link"]',          # 1st line = seller name
+    "detail_seller_legacy": '[data-testid="seller-name"]',          # pre-2026-09 fallback
+    "detail_time_legacy":   "time",                                 # pre-2026-09 fallback
+}
+
+# XPath cannot express "CSS or CSS" for legacy fallbacks, so it lives separately.
+XPATH_DETAIL_REL_TIME = ".//span[contains(text(),'前')]"  # relative age, e.g. "14分前"
+
+TAG_IMG = "img"    # card thumbnail: src + alt ("…のサムネイル")
+TAG_BODY = "body"
+
+# Substrings that betray a Mercari/Cloudflare bot-challenge page (lowercased).
+BOT_CHALLENGE_MARKERS = (
+    "captcha", "recaptcha", "cf-challenge",
+    "access denied", "are you a robot",
+    "just a moment", "checking your browser",
+    "verify you are human", "security check",
+)
+
+
+def _cleanup_profile(profile_dir: str, attempts: int = 3):
+    """Delete a session's temporary Chrome --user-data-dir.
+
+    Every search/detail session creates its own profile under %TEMP%; without
+    this cleanup they accumulated at ~17MB each (3450 dirs / 59.7GB by 2026-09,
+    which filled the user's C: drive). Chrome may still hold handles right after
+    quit(), so retry briefly before giving up.
+    """
+    if not profile_dir or not os.path.isdir(profile_dir):
+        return
+    for i in range(attempts):
+        try:
+            shutil.rmtree(profile_dir)
+            return
+        except Exception:
+            if i == attempts - 1:
+                shutil.rmtree(profile_dir, ignore_errors=True)
+            else:
+                time.sleep(1.5)
+
+
 def _parse_card(card) -> Optional[Item]:
-    """Parse a single item-cell into Item. Returns None on failure or if sold out."""
+    """Parse a single item-cell into Item. Returns None on failure or if sold out.
+
+    Field -> selector mapping lives in SELECTORS (see the DOM Selectors block).
+    """
     from selenium.webdriver.common.by import By
     try:
         # Check for sold-out badge first
-        card_text = card.text
+        card_text = card.text or ""
         if re.search(r'SOLD|売り切れ|売切', card_text):
             return None
 
-        link = card.find_element(By.CSS_SELECTOR, '[data-testid="thumbnail-link"]')
+        link = card.find_element(By.CSS_SELECTOR, SELECTORS["card_link"])
         href = link.get_attribute("href") or ""
         item_id = href.rstrip("/").split("/")[-1] if href else ""
 
-        thumb = card.find_element(By.CSS_SELECTOR, '[role="img"]')
-        aria = thumb.get_attribute("aria-label") or ""
-        name = aria
+        # Title
+        name = ""
+        try:
+            name = (card.find_element(
+                By.CSS_SELECTOR, SELECTORS["card_name"]).text or "").strip()
+        except Exception:
+            pass
+        if not name:
+            # Fallback: thumbnail alt text, e.g. "商品名のサムネイル"
+            try:
+                alt = card.find_element(By.TAG_NAME, TAG_IMG).get_attribute("alt") or ""
+                name = re.sub(r'の(サムネイル|画像)$', '', alt).strip()
+            except Exception:
+                pass
+
+        # Price
         price = 0
-        m = re.search(r'(\d[\d,]*)円', aria)
-        if m:
-            price = int(m.group(1).replace(",", ""))
-            name = aria[:m.start()].replace("の画像", "").strip()
+        try:
+            price_text = card.find_element(
+                By.CSS_SELECTOR, SELECTORS["card_price"]).text or ""
+            m = re.search(r'([\d,]+)', price_text)
+            if m:
+                price = int(m.group(1).replace(",", ""))
+        except Exception:
+            pass
+        if not price:
+            m = re.search(r'[¥￥]\s*([\d,]+)', card_text)
+            if m:
+                price = int(m.group(1).replace(",", ""))
 
         try:
-            img = card.find_element(By.TAG_NAME, "img")
+            img = card.find_element(By.TAG_NAME, TAG_IMG)
             img_url = img.get_attribute("src") or ""
         except Exception:
             img_url = ""
 
-        # Try to get likes count
-        likes = 0
-        try:
-            likes_el = card.find_element(By.CSS_SELECTOR, '[data-testid="like-count"]')
-            likes_text = likes_el.text or ""
-            likes_m = re.search(r'(\d[\d,]*)', likes_text)
-            if likes_m:
-                likes = int(likes_m.group(1).replace(",", ""))
-        except Exception:
-            pass
-
         if name or price:
             item_url = href if href.startswith("http") else f"{BASE_URL}{href}"
             return Item(id=item_id, name=name, price=price, image_url=img_url,
-                        url=item_url, likes=likes)
+                        url=item_url)
     except Exception:
         pass
     return None
@@ -325,6 +423,7 @@ def _selenium_search_once(keyword: str, page: int = 1, order: str = "created_tim
     # the user's own Chrome. Each session uses a unique --user-data-dir below,
     # so a leftover chrome from a crash is harmless (no profile-lock conflict).
     port = random.randint(10000, 60000)
+    profile_dir = os.path.join(os.environ.get("TEMP", "."), f"mercari_chrome_{port}")
     cd_proc = sp.Popen(
         [_CHROMEDRIVER, f"--port={port}", "--readable-timestamp"],
         stdout=sp.DEVNULL, stderr=sp.DEVNULL
@@ -353,7 +452,7 @@ def _selenium_search_once(keyword: str, page: int = 1, order: str = "created_tim
     opts.add_argument("--lang=ja")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument(f"--user-agent={UA}")
-    opts.add_argument(f"--user-data-dir={os.path.join(os.environ.get('TEMP', '.'), f'mercari_chrome_{port}')}")
+    opts.add_argument(f"--user-data-dir={profile_dir}")
 
     try:
         driver = webdriver.Remote(f"http://127.0.0.1:{port}", options=opts)
@@ -388,35 +487,31 @@ def _selenium_search_once(keyword: str, page: int = 1, order: str = "created_tim
 
         # Check if Mercari returned a bot-challenge page
         ps = (driver.page_source or "")[:3000].lower()
-        if any(kw in ps for kw in [
-            "captcha", "recaptcha", "cf-challenge",
-            "access denied", "are you a robot",
-            "just a moment", "checking your browser",
-            "verify you are human", "security check",
-        ]):
+        if any(kw in ps for kw in BOT_CHALLENGE_MARKERS):
             print("  [blocked] Mercari returned a bot challenge page -- backing off")
             driver.quit()
             return result
 
+        grid_or_cell = f'{SELECTORS["search_grid_skeleton"]}, {SELECTORS["search_item_cell"]}'
         WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="item-grid-skeleton"], [data-testid="item-cell"]'))
+            EC.presence_of_element_located((By.CSS_SELECTOR, grid_or_cell))
         )
         time.sleep(3)
         try:
             WebDriverWait(driver, 25).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="item-cell"]'))
+                EC.presence_of_element_located((By.CSS_SELECTOR, SELECTORS["search_item_cell"]))
             )
         except Exception:
             pass
         time.sleep(2)
 
         # Quick check: do we see ANY item cells?
-        initial_cards = driver.find_elements(By.CSS_SELECTOR, '[data-testid="item-cell"]')
+        initial_cards = driver.find_elements(By.CSS_SELECTOR, SELECTORS["search_item_cell"])
         print(f"  [debug] Found {len(initial_cards)} item-cells after load")
 
         # If 0 cells, page might be blocked/broken — dump snippet for diagnosis
         if len(initial_cards) == 0:
-            body_text = (driver.find_element(By.TAG_NAME, "body").text or "")[:300]
+            body_text = (driver.find_element(By.TAG_NAME, TAG_BODY).text or "")[:300]
             print(f"  [debug] Body preview: {body_text}")
 
         seen_ids = set()
@@ -425,7 +520,7 @@ def _selenium_search_once(keyword: str, page: int = 1, order: str = "created_tim
 
         try:
             while len(result.items) < max_items and no_new_rounds < 6:
-                cards = driver.find_elements(By.CSS_SELECTOR, '[data-testid="item-cell"]')
+                cards = driver.find_elements(By.CSS_SELECTOR, SELECTORS["search_item_cell"])
                 for card in cards:
                     if len(result.items) >= max_items:
                         break
@@ -465,6 +560,7 @@ def _selenium_search_once(keyword: str, page: int = 1, order: str = "created_tim
             pass
         cd_proc.terminate()
         cd_proc.wait(timeout=5)
+        _cleanup_profile(profile_dir)
 
     return result
 
@@ -598,7 +694,7 @@ def monitor(keyword: str | list[str], interval_min: int = 30,
                         print(f"[monitor] {n} new items saved to DB for '{kw}'")
                         enrich_items(new_items, fetch_details=True)
                         for it in new_items:
-                            if it.description or it.seller or it.likes or it.listed_at:
+                            if it.description or it.seller or it.listed_at:
                                 _update_sqlite_item(it, db_path)
 
                     if excel_path:
@@ -910,12 +1006,22 @@ def _fetch_item_description(item_id: str) -> dict:
 
 
 def _fetch_item_curl(item_id: str) -> dict:
-    """Fetch item details via curl. Returns {description, seller, likes, listed_at}."""
+    """Fetch item details via curl. Returns {description, seller, listed_at}."""
     url = f"{BASE_URL}/product/{item_id}"
     html = _curl(url)
-    result = {"description": "", "seller": "", "likes": 0, "listed_at": ""}
+    result = {"description": "", "seller": "", "listed_at": ""}
 
     if not html:
+        return result
+
+    # Mercari item pages are fully client-rendered now: curl gets a ~370KB JS
+    # skeleton with no item payload at all. Bail out so enrich_items() goes
+    # straight to the headless path. (The old <meta name="description"> fallback
+    # returned Mercari's generic boilerplate — "…をメルカリでお得に通販…" — and
+    # poisoned the description column.)
+    # SELECTORS hold CSS selectors ("[data-testid=...]"); page source carries the
+    # bare attribute, hence the bracket strip.
+    if SELECTORS["detail_description"].strip("[]") not in html:
         return result
 
     # Try __NEXT_DATA__ on product page
@@ -927,7 +1033,6 @@ def _fetch_item_curl(item_id: str) -> dict:
             item_data = props.get("item", {}) or props
             result["description"] = item_data.get("description", "") or ""
             result["seller"] = (item_data.get("seller") or {}).get("name", "")
-            result["likes"] = int(item_data.get("numLikes", 0) or 0)
             created_ts = 0
             for key in ("created", "createdAt", "publishedAt", "created_at", "published_at"):
                 if item_data.get(key):
@@ -948,15 +1053,8 @@ def _fetch_item_curl(item_id: str) -> dict:
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
 
-    # Fallback: scrape description from meta or structured data
-    if not result["description"]:
-        m_desc = re.search(r'<meta[^>]+name="description"[^>]+content="([^"]+)"', html)
-        if m_desc:
-            result["description"] = m_desc.group(1)
-        else:
-            m_body = re.search(r'商品の説明</h\d>(.*?)(?:<h\d>|出品者情報|$)', html, re.DOTALL)
-            if m_body:
-                result["description"] = re.sub(r'<[^>]+>', '', m_body.group(1)).strip()[:500]
+    # (Removed: the <meta name="description"> fallback returned generic Mercari
+    #  boilerplate rather than the seller's text, and poisoned the DB column.)
 
     # Try <time datetime="..."> element
     if not result["listed_at"]:
@@ -983,8 +1081,8 @@ def _fetch_item_curl(item_id: str) -> dict:
 
 def _fetch_items_headless(item_ids: list[str]) -> dict[str, dict]:
     """Fetch details for multiple items using one headless browser session.
-    Returns {item_id: {description, seller, likes, listed_at}}."""
-    results = {iid: {"description": "", "seller": "", "likes": 0, "listed_at": ""} for iid in item_ids}
+    Returns {item_id: {description, seller, listed_at}}."""
+    results = {iid: {"description": "", "seller": "", "listed_at": ""} for iid in item_ids}
     if not item_ids:
         return results
 
@@ -1002,6 +1100,7 @@ def _fetch_items_headless(item_ids: list[str]) -> dict[str, dict]:
 
     # No global taskkill (see _selenium_search_once) — unique user-data-dir isolates sessions
     port = random.randint(10000, 60000)
+    profile_dir = os.path.join(os.environ.get("TEMP", "."), f"mercari_chrome_{port}")
     cd_proc = sp.Popen(
         [_CHROMEDRIVER, f"--port={port}", "--readable-timestamp"],
         stdout=sp.DEVNULL, stderr=sp.DEVNULL
@@ -1021,7 +1120,7 @@ def _fetch_items_headless(item_ids: list[str]) -> dict[str, dict]:
     opts.add_argument("--lang=ja")
     opts.add_argument("--window-size=1400,900")
     opts.add_argument(f"--user-agent={UA}")
-    opts.add_argument(f"--user-data-dir={os.path.join(os.environ.get('TEMP', '.'), f'mercari_chrome_{port}')}")
+    opts.add_argument(f"--user-data-dir={profile_dir}")
 
     driver = None
     try:
@@ -1039,41 +1138,69 @@ def _fetch_items_headless(item_ids: list[str]) -> dict[str, dict]:
                     Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP', 'ja', 'en-US', 'en']});
                     window.chrome = {runtime: {}};
                 """)
-                time.sleep(1.5)  # let JS hydrate
+                # The detail box hydrates ~3s in and the seller row lands a few
+                # seconds later — a fixed sleep raced both (measured 2026-09).
+                # Wait for the container, then for the seller row itself.
+                try:
+                    WebDriverWait(driver, 15).until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, SELECTORS["detail_root"]))
+                    )
+                except Exception:
+                    pass
+                seller_any = f'{SELECTORS["detail_seller"]}, {SELECTORS["detail_seller_legacy"]}'
+                try:
+                    WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, seller_any))
+                    )
+                except Exception:
+                    pass
 
                 # Extract description
                 try:
-                    desc_el = driver.find_element(By.CSS_SELECTOR, '[data-testid="description"]')
+                    desc_el = driver.find_element(
+                        By.CSS_SELECTOR, SELECTORS["detail_description"])
                     results[item_id]["description"] = desc_el.text[:500]
                 except Exception:
                     pass
 
-                # Extract seller
+                # Extract seller: the seller-name testid is gone — the name now
+                # sits on the first line of [data-testid="seller-link"], which
+                # also carries the review count and verification badges.
                 try:
-                    seller_el = driver.find_element(By.CSS_SELECTOR, '[data-testid="seller-name"]')
-                    results[item_id]["seller"] = seller_el.text.strip()
+                    seller_el = driver.find_element(By.CSS_SELECTOR, SELECTORS["detail_seller"])
+                    results[item_id]["seller"] = (seller_el.text or "").split("\n")[0].strip()
                 except Exception:
-                    pass
+                    try:
+                        seller_el = driver.find_element(
+                            By.CSS_SELECTOR, SELECTORS["detail_seller_legacy"])
+                        results[item_id]["seller"] = seller_el.text.strip()
+                    except Exception:
+                        pass
 
-                # Extract likes (sidebar like count)
+                # Extract listed_at: Mercari dropped <time datetime> from item
+                # pages — the age is only rendered as relative text ("14分前")
+                # beside a clock icon inside the detail box.
                 try:
-                    likes_els = driver.find_elements(By.CSS_SELECTOR, '[data-testid="like-count"]')
-                    for el in likes_els:
-                        m = re.search(r'(\d[\d,]*)', el.text)
-                        if m:
-                            results[item_id]["likes"] = int(m.group(1).replace(",", ""))
+                    container = driver.find_element(
+                        By.CSS_SELECTOR, SELECTORS["detail_root"])
+                    for el in container.find_elements(By.XPATH, XPATH_DETAIL_REL_TIME):
+                        ts = _parse_relative_ja(el.text or "")
+                        if ts:
+                            results[item_id]["listed_at"] = ts
                             break
                 except Exception:
                     pass
 
-                # Extract listed_at from <time> element
-                try:
-                    time_el = driver.find_element(By.TAG_NAME, "time")
-                    dt = time_el.get_attribute("datetime") or ""
-                    if dt:
-                        results[item_id]["listed_at"] = _parse_ts(dt)
-                except Exception:
-                    pass
+                # Fallback (pre-2026 pages): <time datetime="...">
+                if not results[item_id]["listed_at"]:
+                    try:
+                        time_el = driver.find_element(By.TAG_NAME, SELECTORS["detail_time_legacy"])
+                        dt = time_el.get_attribute("datetime") or ""
+                        if dt:
+                            results[item_id]["listed_at"] = _parse_ts(dt)
+                    except Exception:
+                        pass
 
                 # Fallback: search page source for datetime in <time> tags
                 if not results[item_id]["listed_at"]:
@@ -1097,52 +1224,36 @@ def _fetch_items_headless(item_ids: list[str]) -> dict[str, dict]:
                 pass
         cd_proc.terminate()
         cd_proc.wait(timeout=5)
+        _cleanup_profile(profile_dir)
 
     return results
 
 
 def enrich_items(items: list[Item], fetch_details: bool = True):
     """Enrich items with description/details from product pages.
-    Tries curl first (fast), falls back to headless batch (slow but works)."""
+
+    Headless only: Mercari serves curl an item-page skeleton that carries no item
+    payload, so the old curl fast-path could never actually fill anything in.
+    """
     if not fetch_details:
         return
 
-    # Phase 1: try curl for all items (fast path)
-    need_headless = []
-    for i, it in enumerate(items):
-        if it.description and it.seller and it.likes and it.listed_at:
-            continue
-        print(f"\r  [detail] curl {i+1}/{len(items)} {it.id}...", end="")
-        detail = _fetch_item_curl(it.id)
-        if detail["description"]:
-            it.description = detail["description"][:500]
-        if detail["seller"] and not it.seller:
-            it.seller = detail["seller"]
-        if detail["likes"] and not it.likes:
-            it.likes = detail["likes"]
-        if detail["listed_at"]:
-            it.listed_at = detail["listed_at"]
-        # Track items that still need listed_at
-        if not it.listed_at:
-            need_headless.append(it.id)
-        time.sleep(0.1)
-
-    # Phase 2: headless batch for items that curl couldn't handle
+    need_headless = [it.id for it in items
+                     if not (it.description and it.seller and it.listed_at)]
     if need_headless:
-        print(f"\n  [detail] headless batch for {len(need_headless)} items...")
+        print(f"  [detail] headless batch for {len(need_headless)} items...")
         try:
             details = _fetch_items_headless(need_headless)
             for it in items:
-                if it.id in details:
-                    d = details[it.id]
-                    if d["description"] and not it.description:
-                        it.description = d["description"][:500]
-                    if d["seller"] and not it.seller:
-                        it.seller = d["seller"]
-                    if d["likes"] and not it.likes:
-                        it.likes = d["likes"]
-                    if d["listed_at"] and not it.listed_at:
-                        it.listed_at = d["listed_at"]
+                d = details.get(it.id)
+                if not d:
+                    continue
+                if d["description"] and not it.description:
+                    it.description = d["description"][:500]
+                if d["seller"] and not it.seller:
+                    it.seller = d["seller"]
+                if d["listed_at"] and not it.listed_at:
+                    it.listed_at = d["listed_at"]
         except Exception as e:
             print(f"\n  [!] headless enrichment failed: {e}")
 
@@ -1154,6 +1265,27 @@ def enrich_items(items: list[Item], fetch_details: bool = True):
     print()
 
 
+# Excel column layout. Headers are resolved against each file's OWN header row
+# (see _excel_layout) rather than fixed positions, so workbooks written before
+# the 点赞 column was dropped keep working instead of shifting every column.
+EXCEL_HEADERS = ["ID", "标题", "价格", "图片", "商品链接", "卖家",
+                 "商品説明", "评论", "发布时间", "爬取时间"]
+EXCEL_COL_WIDTHS = {"ID": 18, "标题": 45, "价格": 11, "图片": 18, "商品链接": 35,
+                    "卖家": 14, "商品説明": 55, "评论": 40, "发布时间": 12, "爬取时间": 18}
+EXCEL_WRAP_HEADERS = ("标题", "商品説明", "评论")
+EXCEL_IMAGE_HEADER = "图片"  # embedded images are anchored to this column
+
+
+def _excel_layout(ws) -> dict:
+    """Map a sheet's header names -> 1-based column index, from its own row 1."""
+    layout = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=1, column=c).value
+        if v:
+            layout[str(v).strip()] = c
+    return layout
+
+
 def export_to_excel(items: list[Item], filepath: str = "./mercari_items.xlsx"):
     """Export/append items to Excel file. Deduplicates by item id. Embeds images."""
     from datetime import datetime
@@ -1161,13 +1293,25 @@ def export_to_excel(items: list[Item], filepath: str = "./mercari_items.xlsx"):
     from openpyxl import Workbook, load_workbook
     from openpyxl.drawing.image import Image as XLImage
     from openpyxl.styles import Alignment
+    from openpyxl.utils import get_column_letter
 
-    headers = ["ID", "标题", "价格", "图片", "商品链接", "卖家", "点赞", "商品説明", "评论", "发布时间", "爬取时间"]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    def _embed_images(ws, item, row_num):
-        """Download and embed item image into column D. Converts webp to PNG."""
-        if not item.image_url:
+    def _row_values(it) -> dict:
+        return {"ID": it.id, "标题": it.name, "价格": it.price, "图片": "",
+                "商品链接": it.url, "卖家": it.seller, "商品説明": it.description,
+                "评论": it.comments, "发布时间": it.listed_at, "爬取时间": now}
+
+    def _write_row(ws, row_num, it, layout):
+        for header, val in _row_values(it).items():
+            col = layout.get(header)
+            if col:
+                ws.cell(row=row_num, column=col).value = val
+
+    def _embed_images(ws, item, row_num, layout):
+        """Download and embed the item image into the 图片 column. webp → PNG."""
+        col = layout.get(EXCEL_IMAGE_HEADER)
+        if not item.image_url or not col:
             return
         try:
             img_bytes = _curl(item.image_url, raw=True, use_proxy=True, timeout=15)
@@ -1182,24 +1326,21 @@ def export_to_excel(items: list[Item], filepath: str = "./mercari_items.xlsx"):
                 xl_img = XLImage(img_buffer)
                 xl_img.width = 120
                 xl_img.height = 120
-                ws.add_image(xl_img, f"D{row_num}")
+                ws.add_image(xl_img, f"{get_column_letter(col)}{row_num}")
                 ws.row_dimensions[row_num].height = 95
         except Exception:
             pass
 
-    def _apply_styles(ws):
-        """Apply column widths and text wrapping."""
-        col_widths = {'A': 18, 'B': 45, 'C': 11, 'D': 18, 'E': 35,
-                      'F': 14, 'G': 7, 'H': 55, 'I': 40, 'J': 12, 'K': 18}
-        wrap_cols = {'B', 'H', 'I'}  # 标题, 商品説明, 评论
-
-        for col_letter, width in col_widths.items():
-            ws.column_dimensions[col_letter].width = width
+    def _apply_styles(ws, layout):
+        """Apply column widths and text wrapping, keyed by header name."""
+        for header, col in layout.items():
+            if header in EXCEL_COL_WIDTHS:
+                ws.column_dimensions[get_column_letter(col)].width = EXCEL_COL_WIDTHS[header]
+        wrap_cols = {layout[h] for h in EXCEL_WRAP_HEADERS if h in layout}
 
         for row in ws.iter_rows(min_row=1, max_row=ws.max_row):
             for cell in row:
-                col_letter = cell.column_letter
-                if col_letter in wrap_cols:
+                if cell.column in wrap_cols:
                     cell.alignment = Alignment(wrap_text=True, vertical='top')
                 else:
                     cell.alignment = Alignment(vertical='top')
@@ -1207,16 +1348,26 @@ def export_to_excel(items: list[Item], filepath: str = "./mercari_items.xlsx"):
     if os.path.exists(filepath):
         wb = load_workbook(filepath)
         ws = wb.active
+        layout = _excel_layout(ws)
+        if "ID" not in layout:
+            wb.close()
+            # Loud on purpose: silently writing at guessed offsets would shuffle
+            # every column. The user just needs to rename/move the odd file.
+            raise ValueError(
+                f"{filepath}: 表头里找不到 'ID' 列，无法定位数据行。"
+                f"请改用手动指定新文件名，或修正该表头。")
 
+        id_col = layout["ID"]
         # Build existing IDs + collect empty-row slots (from user deletions)
         existing_ids = set()
         empty_rows = []  # rows where all cells are None
         last_used_row = 1  # header
         for row in range(2, ws.max_row + 1):
-            row_vals = [ws.cell(row=row, column=c).value for c in range(1, 12)]
+            row_vals = [ws.cell(row=row, column=c).value
+                        for c in range(1, ws.max_column + 1)]
             if any(v is not None for v in row_vals):
                 last_used_row = row
-                vid = row_vals[0]
+                vid = row_vals[id_col - 1]
                 if vid:
                     existing_ids.add(str(vid))
             else:
@@ -1227,8 +1378,6 @@ def export_to_excel(items: list[Item], filepath: str = "./mercari_items.xlsx"):
             if it.id in existing_ids:
                 continue
             existing_ids.add(it.id)
-            row_data = [it.id, it.name, it.price, "", it.url,
-                        it.seller, it.likes, it.description, it.comments, it.listed_at, now]
 
             # Fill empty slots first, then append after last_used_row
             if empty_rows:
@@ -1237,35 +1386,36 @@ def export_to_excel(items: list[Item], filepath: str = "./mercari_items.xlsx"):
                 last_used_row += 1
                 row_num = last_used_row
 
-            for c, val in enumerate(row_data, 1):
-                ws.cell(row=row_num, column=c).value = val
-            _embed_images(ws, it, row_num)
+            _write_row(ws, row_num, it, layout)
+            _embed_images(ws, it, row_num, layout)
             new_count += 1
             print(f"\r  [img] {new_count}/{len(items)}", end="")
         if new_count:
-            _apply_styles(ws)
+            _apply_styles(ws, layout)
             print()
         wb.save(filepath)
         # Real total: scan for last non-empty row after writing
         real_last = 1
         for row in range(2, ws.max_row + 1):
-            if any(ws.cell(row=row, column=c).value is not None for c in range(1, 12)):
+            if any(ws.cell(row=row, column=c).value is not None
+                   for c in range(1, ws.max_column + 1)):
                 real_last = row
+        wb.close()
         print(f"[Excel] 追加 {new_count} 条，共 {real_last - 1} 条 → {filepath}")
     else:
         wb = Workbook()
         ws = wb.active
-        ws.append(headers)
+        ws.append(EXCEL_HEADERS)
+        layout = _excel_layout(ws)
         for i, it in enumerate(items, 1):
-            row_data = [it.id, it.name, it.price, "", it.url,
-                        it.seller, it.likes, it.description, it.comments, it.listed_at, now]
-            ws.append(row_data)
             row_num = i + 1
-            _embed_images(ws, it, row_num)
+            _write_row(ws, row_num, it, layout)
+            _embed_images(ws, it, row_num, layout)
             print(f"\r  [img] {i}/{len(items)}", end="")
-        _apply_styles(ws)
+        _apply_styles(ws, layout)
         print()
         wb.save(filepath)
+        wb.close()
         print(f"[Excel] 新建 {len(items)} 条 → {filepath}")
 
 
@@ -1279,30 +1429,34 @@ def _export_update_excel(items: list[Item], filepath: str):
 
     wb = load_workbook(filepath)
     ws = wb.active
+    layout = _excel_layout(ws)
+    if "ID" not in layout:
+        wb.close()
+        return
 
-    # Build ID → row_num map (column A)
+    # Build ID → row_num map
+    id_col = layout["ID"]
     id_to_row = {}
     for row in range(2, ws.max_row + 1):
-        vid = ws.cell(row=row, column=1).value
+        vid = ws.cell(row=row, column=id_col).value
         if vid:
             id_to_row[str(vid)] = row
+
+    # Resolved against the file's own header row, so old workbooks that still
+    # carry a 点赞 column update the right cells instead of shifting by one.
+    updatable = (("卖家", "seller"), ("商品説明", "description"),
+                 ("评论", "comments"), ("发布时间", "listed_at"))
 
     updated = 0
     for it in items:
         row = id_to_row.get(it.id)
         if not row:
             continue
-        # Col F=卖家, G=点赞, H=商品説明, I=评论, J=发布时间
-        if it.seller:
-            ws.cell(row=row, column=6).value = it.seller
-        if it.likes:
-            ws.cell(row=row, column=7).value = it.likes
-        if it.description:
-            ws.cell(row=row, column=8).value = it.description
-        if it.comments:
-            ws.cell(row=row, column=9).value = it.comments
-        if it.listed_at:
-            ws.cell(row=row, column=10).value = it.listed_at
+        for header, attr in updatable:
+            col = layout.get(header)
+            val = getattr(it, attr, "")
+            if col and val:
+                ws.cell(row=row, column=col).value = val
         updated += 1
 
     if updated:
@@ -1318,6 +1472,10 @@ DB_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mercari.d
 def _init_db(db_path: str = DB_DEFAULT):
     """Create SQLite table if not exists. Migrates old schema if needed."""
     conn = sqlite3.connect(db_path)
+    # No `likes` column: Mercari stopped exposing like counts in 2026-09, so the
+    # field was dropped. Databases created earlier still carry the column and
+    # keep their old data — CREATE TABLE IF NOT EXISTS leaves it alone, and
+    # nothing reads or writes it any more.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS items (
             id TEXT,
@@ -1327,7 +1485,6 @@ def _init_db(db_path: str = DB_DEFAULT):
             image_url TEXT,
             url TEXT,
             seller TEXT,
-            likes INTEGER DEFAULT 0,
             description TEXT,
             comments TEXT,
             crawled_at TEXT,
@@ -1360,10 +1517,10 @@ def save_to_sqlite(items: list[Item], db_path: str = DB_DEFAULT, keyword: str = 
     for it in items:
         try:
             conn.execute("""
-                INSERT OR IGNORE INTO items (id, keyword, name, price, image_url, url, seller, likes, description, comments, crawled_at, listed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO items (id, keyword, name, price, image_url, url, seller, description, comments, crawled_at, listed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (it.id, keyword, it.name, it.price, it.image_url, it.url,
-                  it.seller, it.likes, it.description, it.comments, now, it.listed_at))
+                  it.seller, it.description, it.comments, now, it.listed_at))
             if conn.execute("SELECT changes()").fetchone()[0] > 0:
                 count += 1
         except Exception:
@@ -1396,16 +1553,15 @@ def get_keywords(db_path: str = DB_DEFAULT) -> list[str]:
 
 
 def _update_sqlite_item(item: Item, db_path: str = DB_DEFAULT):
-    """Update an existing item's detail fields (seller, likes, description, comments, listed_at)."""
+    """Update an existing item's detail fields (seller, description, comments, listed_at)."""
     conn = sqlite3.connect(db_path, timeout=30)
     conn.execute("""
         UPDATE items SET seller=COALESCE(NULLIF(?, ''), seller),
-                         likes=CASE WHEN ? > 0 THEN ? ELSE likes END,
                          description=COALESCE(NULLIF(?, ''), description),
                          comments=COALESCE(NULLIF(?, ''), comments),
                          listed_at=CASE WHEN ? != '' THEN ? ELSE listed_at END
         WHERE id=?
-    """, (item.seller, item.likes, item.likes, item.description, item.comments,
+    """, (item.seller, item.description, item.comments,
           item.listed_at, item.listed_at, item.id))
     conn.commit()
     conn.close()
@@ -1539,7 +1695,7 @@ def main():
             enrich_items(all_items, fetch_details=True)
             if db_path:
                 for it in all_items:
-                    if it.description or it.seller or it.likes or it.listed_at:
+                    if it.description or it.seller or it.listed_at:
                         _update_sqlite_item(it, db_path)
             if excel_path:
                 _export_update_excel(all_items, excel_path)
